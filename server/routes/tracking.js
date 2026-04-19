@@ -3,52 +3,55 @@ const router = express.Router();
 const { getDb } = require('../db/database');
 
 // GET /t/o/:trackingId - Open tracking pixel
-router.get('/o/:trackingId', (req, res) => {
+router.get('/o/:trackingId', async (req, res) => {
   const { trackingId } = req.params;
-  const db = getDb();
-
-  // Skip bots and pre-fetchers (Apple Mail proxy, Google image proxy, etc.)
   const ua = req.get('user-agent') || '';
   const isBotOrProxy = /googleimageproxy|google image proxy|yahoo|bing|apple|msnbot|bot|crawler|spider|preview|prefetch|facebookexternalhit/i.test(ua);
 
   try {
-    const lead = db.prepare(`SELECT id, campaign_id, open_count FROM leads WHERE tracking_id = ?`).get(trackingId);
-    const seqLog = !lead ? db.prepare(`SELECT id, lead_id, open_count FROM sequence_log WHERE tracking_id = ?`).get(trackingId) : null;
+    const db = await getDb();
+    
+    // Find in main leads table
+    const leadRes = await db.query('SELECT id, campaign_id, open_count FROM leads WHERE tracking_id = $1', [trackingId]);
+    const lead = leadRes.rows[0];
+    
+    // If not found, check sequence log
+    let seqLog = null;
+    if (!lead) {
+      const seqRes = await db.query('SELECT id, lead_id, open_count FROM sequence_log WHERE tracking_id = $1', [trackingId]);
+      seqLog = seqRes.rows[0];
+    }
 
     if (!isBotOrProxy) {
       if (lead) {
-        // Always log the raw event
-        db.prepare(`
+        await db.query(`
           INSERT INTO tracking_events (tracking_id, lead_id, event_type, ip_address, user_agent)
-          VALUES (?, ?, 'open', ?, ?)
-        `).run(trackingId, lead.id, req.ip, ua);
+          VALUES ($1, $2, 'open', $3, $4)
+        `, [trackingId, lead.id, req.ip, ua]);
 
-        // Only increment campaign open count on the FIRST open
-        const isFirstOpen = lead.open_count === 0;
-        db.prepare(`
-          UPDATE leads SET open_count = open_count + 1, last_opened_at = CURRENT_TIMESTAMP WHERE id = ?
-        `).run(lead.id);
+        const isFirstOpen = parseInt(lead.open_count) === 0;
+        await db.query(`
+          UPDATE leads SET open_count = open_count + 1, last_opened_at = CURRENT_TIMESTAMP WHERE id = $1
+        `, [lead.id]);
 
         if (isFirstOpen) {
-          db.prepare(`
-            UPDATE campaigns SET open_count = open_count + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?
-          `).run(lead.campaign_id);
+          await db.query(`
+            UPDATE campaigns SET open_count = open_count + 1, updated_at = CURRENT_TIMESTAMP WHERE id = $1
+          `, [lead.campaign_id]);
         }
       } else if (seqLog) {
-        db.prepare(`
+        await db.query(`
           INSERT INTO tracking_events (tracking_id, lead_id, event_type, ip_address, user_agent)
-          VALUES (?, ?, 'open', ?, ?)
-        `).run(trackingId, seqLog.lead_id, req.ip, ua);
+          VALUES ($1, $2, 'open', $3, $4)
+        `, [trackingId, seqLog.lead_id, req.ip, ua]);
 
-        db.prepare(`
-          UPDATE sequence_log SET open_count = open_count + 1 WHERE id = ?
-        `).run(seqLog.id);
+        await db.query(`
+          UPDATE sequence_log SET open_count = open_count + 1 WHERE id = $1
+        `, [seqLog.id]);
 
-        // Only increment parent lead on first open
-        const parentLead = db.prepare(`SELECT open_count FROM leads WHERE id = ?`).get(seqLog.lead_id);
-        db.prepare(`
-          UPDATE leads SET open_count = open_count + 1, last_opened_at = CURRENT_TIMESTAMP WHERE id = ?
-        `).run(seqLog.lead_id);
+        await db.query(`
+          UPDATE leads SET open_count = open_count + 1, last_opened_at = CURRENT_TIMESTAMP WHERE id = $1
+        `, [seqLog.lead_id]);
       }
     }
   } catch (err) {
@@ -68,61 +71,63 @@ router.get('/o/:trackingId', (req, res) => {
 });
 
 // GET /t/c/:trackingId - Click tracking redirect
-router.get('/c/:trackingId', (req, res) => {
+router.get('/c/:trackingId', async (req, res) => {
   const { trackingId } = req.params;
   const { url } = req.query;
-  const db = getDb();
+  const ua = req.get('user-agent') || '';
+  const isBotOrProxy = /googleimageproxy|google image proxy|yahoo|bing|apple|msnbot|bot|crawler|spider|preview|prefetch|facebookexternalhit/i.test(ua);
 
   if (!url) {
     return res.status(400).send('Missing redirect URL');
   }
 
-  // Filter known bots/crawlers
-  const ua = req.get('user-agent') || '';
-  const isBotOrProxy = /googleimageproxy|google image proxy|yahoo|bing|apple|msnbot|bot|crawler|spider|preview|prefetch|facebookexternalhit/i.test(ua);
-
   try {
+    const db = await getDb();
     if (!isBotOrProxy) {
-      const lead = db.prepare(`SELECT id, campaign_id, click_count FROM leads WHERE tracking_id = ?`).get(trackingId);
-      const seqLog = !lead ? db.prepare(`SELECT id, lead_id, click_count FROM sequence_log WHERE tracking_id = ?`).get(trackingId) : null;
+      const leadRes = await db.query('SELECT id, campaign_id, click_count FROM leads WHERE tracking_id = $1', [trackingId]);
+      const lead = leadRes.rows[0];
+      
+      let seqLog = null;
+      if (!lead) {
+        const seqRes = await db.query('SELECT id, lead_id, click_count FROM sequence_log WHERE tracking_id = $1', [trackingId]);
+        seqLog = seqRes.rows[0];
+      }
 
       if (lead) {
-        // Check if this exact URL was already clicked (deduplicate per unique link)
-        const alreadyClicked = db.prepare(`
+        const clickedRes = await db.query(`
           SELECT id FROM tracking_events 
-          WHERE tracking_id = ? AND event_type = 'click' AND link_url = ?
+          WHERE tracking_id = $1 AND event_type = 'click' AND link_url = $2
           LIMIT 1
-        `).get(trackingId, url);
+        `, [trackingId, url]);
+        const alreadyClicked = clickedRes.rowCount > 0;
 
-        db.prepare(`
+        await db.query(`
           INSERT INTO tracking_events (tracking_id, lead_id, event_type, link_url, ip_address, user_agent)
-          VALUES (?, ?, 'click', ?, ?, ?)
-        `).run(trackingId, lead.id, url, req.ip, ua);
+          VALUES ($1, $2, 'click', $3, $4, $5)
+        `, [trackingId, lead.id, url, req.ip, ua]);
 
-        // Always update lead click count
-        db.prepare(`
-          UPDATE leads SET click_count = click_count + 1, last_clicked_at = CURRENT_TIMESTAMP WHERE id = ?
-        `).run(lead.id);
+        await db.query(`
+          UPDATE leads SET click_count = click_count + 1, last_clicked_at = CURRENT_TIMESTAMP WHERE id = $1
+        `, [lead.id]);
 
-        // Only increment campaign click count on first click of this link
         if (!alreadyClicked) {
-          db.prepare(`
-            UPDATE campaigns SET click_count = click_count + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?
-          `).run(lead.campaign_id);
+          await db.query(`
+            UPDATE campaigns SET click_count = click_count + 1, updated_at = CURRENT_TIMESTAMP WHERE id = $1
+          `, [lead.campaign_id]);
         }
       } else if (seqLog) {
-        db.prepare(`
+        await db.query(`
           INSERT INTO tracking_events (tracking_id, lead_id, event_type, link_url, ip_address, user_agent)
-          VALUES (?, ?, 'click', ?, ?, ?)
-        `).run(trackingId, seqLog.lead_id, url, req.ip, ua);
+          VALUES ($1, $2, 'click', $3, $4, $5)
+        `, [trackingId, seqLog.lead_id, url, req.ip, ua]);
 
-        db.prepare(`
-          UPDATE sequence_log SET click_count = click_count + 1 WHERE id = ?
-        `).run(seqLog.id);
+        await db.query(`
+          UPDATE sequence_log SET click_count = click_count + 1 WHERE id = $1
+        `, [seqLog.id]);
 
-        db.prepare(`
-          UPDATE leads SET click_count = click_count + 1, last_clicked_at = CURRENT_TIMESTAMP WHERE id = ?
-        `).run(seqLog.lead_id);
+        await db.query(`
+          UPDATE leads SET click_count = click_count + 1, last_clicked_at = CURRENT_TIMESTAMP WHERE id = $1
+        `, [seqLog.lead_id]);
       }
     }
   } catch (err) {
@@ -134,4 +139,3 @@ router.get('/c/:trackingId', (req, res) => {
 });
 
 module.exports = router;
-

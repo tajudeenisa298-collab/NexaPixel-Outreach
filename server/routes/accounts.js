@@ -6,8 +6,7 @@ const { verifyGmailAccount } = require('../services/gmailSender');
 // POST /api/accounts - Add a new sender account
 router.post('/', async (req, res) => {
   const { email, password, type, display_name } = req.body;
-  const db = getDb();
-
+  
   if (!email || !password || !type) {
     return res.status(400).json({ error: 'Email, password, and type are required' });
   }
@@ -30,15 +29,15 @@ router.post('/', async (req, res) => {
     : { daily: 300, hourly: 50 };
 
   try {
-    const insertStmt = db.prepare(`
+    const db = await getDb();
+    await db.query(`
       INSERT INTO sender_accounts (email, type, password, display_name, daily_limit, hourly_limit)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `);
-
-    insertStmt.run(email, type, password, display_name || email.split('@')[0], limits.daily, limits.hourly);
+      VALUES ($1, $2, $3, $4, $5, $6)
+    `, [email, type, password, display_name || email.split('@')[0], limits.daily, limits.hourly]);
+    
     res.status(201).json({ success: true, message: 'Account added successfully' });
   } catch (err) {
-    if (err.message.includes('UNIQUE constraint failed')) {
+    if (err.message.includes('unique constraint') || err.code === '23505') {
       return res.status(400).json({ error: 'This email is already connected' });
     }
     console.error('Add account error:', err);
@@ -47,10 +46,10 @@ router.post('/', async (req, res) => {
 });
 
 // DELETE /api/accounts/:id - Remove a sender account
-router.delete('/:id', (req, res) => {
-  const db = getDb();
+router.delete('/:id', async (req, res) => {
   try {
-    db.prepare(`DELETE FROM sender_accounts WHERE id = ?`).run(req.params.id);
+    const db = await getDb();
+    await db.query(`DELETE FROM sender_accounts WHERE id = $1`, [req.params.id]);
     res.json({ success: true, message: 'Account deleted' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -58,11 +57,11 @@ router.delete('/:id', (req, res) => {
 });
 
 // PUT /api/accounts/:id/pause - Toggle sender pause state
-router.put('/:id/pause', (req, res) => {
-  const { is_paused } = req.body;
-  const db = getDb();
+router.put('/:id/pause', async (req, res) => {
   try {
-    db.prepare(`UPDATE sender_accounts SET is_paused = ? WHERE id = ?`).run(is_paused ? 1 : 0, req.params.id);
+    const { is_paused } = req.body;
+    const db = await getDb();
+    await db.query(`UPDATE sender_accounts SET is_paused = $1 WHERE id = $2`, [is_paused ? 1 : 0, req.params.id]);
     res.json({ success: true, message: is_paused ? 'Account paused' : 'Account resumed' });
   } catch (err) {
     res.status(500).json({ error: err.message });

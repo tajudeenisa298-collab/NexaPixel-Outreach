@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
-const { getDb, seedSenderAccounts } = require('./db/database');
+const { getDb, initSchema, seedSenderAccounts } = require('./db/database');
 const { resumeOnStartup, loadSettings } = require('./services/emailQueue');
 const { startSequenceEngine } = require('./services/sequenceEngine');
 
@@ -17,10 +17,23 @@ app.use(express.urlencoded({ extended: true }));
 // Trust proxy for IP tracking
 app.set('trust proxy', true);
 
-// Initialize database and seed accounts
-getDb();
-loadSettings();
-seedSenderAccounts();
+const pool = require('./db/database').pool;
+const { initSchema, seedSenderAccounts } = require('./db/database');
+
+async function startApp() {
+  try {
+    // Initialize database
+    await initSchema();
+    console.log('Database schema initialized');
+    
+    await loadSettings();
+    await seedSenderAccounts();
+  } catch (error) {
+    console.error('Failed to initialize app state:', error);
+  }
+}
+
+startApp();
 
 // API Routes
 app.use('/api/campaigns', require('./routes/campaigns'));

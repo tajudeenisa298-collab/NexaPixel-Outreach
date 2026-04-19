@@ -10,35 +10,46 @@ const MAX_RETRIES = 3;
 /**
  * Queue all pending leads for a campaign
  */
-function queueCampaign(campaignId) {
-  const db = getDb();
+async function queueCampaign(campaignId) {
+  try {
+    const db = await getDb();
+    const client = await db.connect();
 
-  // Generate tracking IDs for all pending leads
-  const leads = db.prepare(`
-    SELECT id FROM leads WHERE campaign_id = ? AND status = 'pending'
-  `).all(campaignId);
+    try {
+      await client.query('BEGIN');
 
-  const updateStmt = db.prepare(`
-    UPDATE leads SET status = 'queued', tracking_id = ? WHERE id = ?
-  `);
+      // Get pending leads
+      const leadsRes = await client.query(`
+        SELECT id FROM leads WHERE campaign_id = $1 AND status = 'pending'
+      `, [campaignId]);
+      const leads = leadsRes.rows;
 
-  const queueAll = db.transaction(() => {
-    for (const lead of leads) {
-      const trackingId = generateTrackingId();
-      updateStmt.run(trackingId, lead.id);
+      for (const lead of leads) {
+        const trackingId = generateTrackingId();
+        await client.query(`
+          UPDATE leads SET status = 'queued', tracking_id = $1 WHERE id = $2
+        `, [trackingId, lead.id]);
+      }
+
+      await client.query(`
+        UPDATE campaigns SET status = 'active', started_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1
+      `, [campaignId]);
+
+      await client.query('COMMIT');
+      console.log(`📧 Queued ${leads.length} leads for campaign ${campaignId}`);
+
+      // Start processing if not already running
+      startProcessing();
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
     }
-
-    db.prepare(`
-      UPDATE campaigns SET status = 'active', started_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).run(campaignId);
-  });
-
-  queueAll();
-  console.log(`📧 Queued ${leads.length} leads for campaign ${campaignId}`);
-
-  // Start processing if not already running
-  startProcessing();
+  } catch (err) {
+    console.error('Queue campaign error:', err.message);
+  }
 }
 
 /**
@@ -48,26 +59,28 @@ async function processNextEmail() {
   if (isProcessing) return;
   isProcessing = true;
 
-  const db = getDb();
-
   try {
+    const db = await getDb();
+
     // Get the next queued lead
-    const lead = db.prepare(`
+    const leadRes = await db.query(`
       SELECT l.*, c.name as campaign_name
       FROM leads l
       JOIN campaigns c ON c.id = l.campaign_id
       WHERE l.status = 'queued' AND c.status = 'active'
       ORDER BY l.created_at ASC
       LIMIT 1
-    `).get();
+    `);
+    const lead = leadRes.rows[0];
 
     if (!lead) {
       // Check if any active campaigns remain
-      const activeCampaigns = db.prepare(`
+      const activeCampaignsRes = await db.query(`
         SELECT COUNT(*) as count FROM campaigns WHERE status = 'active'
-      `).get();
+      `);
+      const activeCount = parseInt(activeCampaignsRes.rows[0].count);
 
-      if (activeCampaigns.count === 0) {
+      if (activeCount === 0) {
         console.log('✅ All queued emails have been processed');
         stopProcessing();
       }
@@ -76,7 +89,7 @@ async function processNextEmail() {
     }
 
     // Mark as sending
-    db.prepare(`UPDATE leads SET status = 'sending' WHERE id = ?`).run(lead.id);
+    await db.query(`UPDATE leads SET status = 'sending' WHERE id = $1`, [lead.id]);
 
     // Prepare the email with tracking
     const htmlBody = prepareEmailBody(lead.body, lead.tracking_id);
@@ -92,57 +105,56 @@ async function processNextEmail() {
 
     if (result.success) {
       // Mark as sent
-      db.prepare(`
+      await db.query(`
         UPDATE leads
-        SET status = 'sent', sent_at = CURRENT_TIMESTAMP, sent_via = ?, sender_email = ?
-        WHERE id = ?
-      `).run(result.senderType, result.senderEmail, lead.id);
+        SET status = 'sent', sent_at = CURRENT_TIMESTAMP, sent_via = $1, sender_email = $2
+        WHERE id = $3
+      `, [result.senderType, result.senderEmail, lead.id]);
 
       // Update campaign counters
-      db.prepare(`
-        UPDATE campaigns SET sent_count = sent_count + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?
-      `).run(lead.campaign_id);
+      await db.query(`
+        UPDATE campaigns SET sent_count = sent_count + 1, updated_at = CURRENT_TIMESTAMP WHERE id = $1
+      `, [lead.campaign_id]);
 
       // Log the send
-      db.prepare(`
+      await db.query(`
         INSERT INTO send_log (campaign_id, lead_id, sender_email, recipient_email, subject, status)
-        VALUES (?, ?, ?, ?, ?, 'sent')
-      `).run(lead.campaign_id, lead.id, result.senderEmail, lead.recipient_email, lead.subject);
+        VALUES ($1, $2, $3, $4, $5, 'sent')
+      `, [lead.campaign_id, lead.id, result.senderEmail, lead.recipient_email, lead.subject]);
 
       console.log(`✉️  Sent to ${lead.recipient_email} via ${result.senderEmail}`);
     } else if (result.exhausted) {
-      // All accounts exhausted, put back to queued and pause
-      db.prepare(`UPDATE leads SET status = 'queued' WHERE id = ?`).run(lead.id);
-      console.log('⏸️  All sender accounts exhausted. Pausing queue...');
-      // Don't stop - the resetCountersIfNeeded will re-enable accounts
+      // All accounts exhausted, put back to queued
+      await db.query(`UPDATE leads SET status = 'queued' WHERE id = $1`, [lead.id]);
+      console.log('⏸️  All sender accounts exhausted. Waiting for reset...');
     } else {
       // Send failed
-      const retryCount = (lead.retry_count || 0) + 1;
+      const retryCount = (parseInt(lead.retry_count) || 0) + 1;
       if (retryCount >= MAX_RETRIES) {
-        db.prepare(`
-          UPDATE leads SET status = 'failed', error_message = ?, retry_count = ? WHERE id = ?
-        `).run(result.error, retryCount, lead.id);
+        await db.query(`
+          UPDATE leads SET status = 'failed', error_message = $1, retry_count = $2 WHERE id = $3
+        `, [result.error, retryCount, lead.id]);
 
-        db.prepare(`
-          UPDATE campaigns SET failed_count = failed_count + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?
-        `).run(lead.campaign_id);
+        await db.query(`
+          UPDATE campaigns SET failed_count = failed_count + 1, updated_at = CURRENT_TIMESTAMP WHERE id = $1
+        `, [lead.campaign_id]);
 
-        db.prepare(`
+        await db.query(`
           INSERT INTO send_log (campaign_id, lead_id, sender_email, recipient_email, subject, status, error_message)
-          VALUES (?, ?, ?, ?, ?, 'failed', ?)
-        `).run(lead.campaign_id, lead.id, result.senderEmail || 'unknown', lead.recipient_email, lead.subject, result.error);
+          VALUES ($1, $2, $3, $4, $5, 'failed', $6)
+        `, [lead.campaign_id, lead.id, result.senderEmail || 'unknown', lead.recipient_email, lead.subject, result.error]);
       } else {
         // Retry later
-        db.prepare(`
-          UPDATE leads SET status = 'queued', retry_count = ?, error_message = ? WHERE id = ?
-        `).run(retryCount, result.error, lead.id);
+        await db.query(`
+          UPDATE leads SET status = 'queued', retry_count = $1, error_message = $2 WHERE id = $3
+        `, [retryCount, result.error, lead.id]);
       }
 
       console.log(`❌ Failed: ${lead.recipient_email} - ${result.error}`);
     }
 
     // Check if campaign is complete
-    checkCampaignCompletion(lead.campaign_id);
+    await checkCampaignCompletion(lead.campaign_id);
 
   } catch (error) {
     console.error('Queue processing error:', error);
@@ -154,19 +166,23 @@ async function processNextEmail() {
 /**
  * Check if all leads in a campaign have been processed
  */
-function checkCampaignCompletion(campaignId) {
-  const db = getDb();
-  const remaining = db.prepare(`
-    SELECT COUNT(*) as count FROM leads
-    WHERE campaign_id = ? AND status IN ('pending', 'queued', 'sending')
-  `).get(campaignId);
+async function checkCampaignCompletion(campaignId) {
+  try {
+    const db = await getDb();
+    const res = await db.query(`
+      SELECT COUNT(*) as count FROM leads
+      WHERE campaign_id = $1 AND status IN ('pending', 'queued', 'sending')
+    `, [campaignId]);
 
-  if (remaining.count === 0) {
-    db.prepare(`
-      UPDATE campaigns SET status = 'completed', completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).run(campaignId);
-    console.log(`🎉 Campaign ${campaignId} completed!`);
+    if (parseInt(res.rows[0].count) === 0) {
+      await db.query(`
+        UPDATE campaigns SET status = 'completed', completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1
+      `, [campaignId]);
+      console.log(`🎉 Campaign ${campaignId} completed!`);
+    }
+  } catch (e) {
+    console.error('Check completion error:', e.message);
   }
 }
 
@@ -176,14 +192,12 @@ function checkCampaignCompletion(campaignId) {
 function startProcessing() {
   if (queueInterval) return;
 
-  // Add a random jitter to the base interval
   queueInterval = setInterval(async () => {
-    const jitter = Math.floor(Math.random() * 2000); // 0-2s jitter so it's not perfectly robotic
+    const jitter = Math.floor(Math.random() * 2000);
     await new Promise(resolve => setTimeout(resolve, jitter));
     await processNextEmail();
   }, currentSendInterval);
 
-  // Process the first one immediately
   processNextEmail();
   console.log('🚀 Email queue processing started');
 }
@@ -202,62 +216,71 @@ function stopProcessing() {
 /**
  * Pause a campaign
  */
-function pauseCampaign(campaignId) {
-  const db = getDb();
-  db.prepare(`UPDATE campaigns SET status = 'paused', updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(campaignId);
-  // Put sending leads back to queued
-  db.prepare(`UPDATE leads SET status = 'queued' WHERE campaign_id = ? AND status = 'sending'`).run(campaignId);
+async function pauseCampaign(campaignId) {
+  try {
+    const db = await getDb();
+    await db.query(`UPDATE campaigns SET status = 'paused', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [campaignId]);
+    await db.query(`UPDATE leads SET status = 'queued' WHERE campaign_id = $1 AND status = 'sending'`, [campaignId]);
 
-  // Check if any other active campaigns exist
-  const active = db.prepare(`SELECT COUNT(*) as count FROM campaigns WHERE status = 'active'`).get();
-  if (active.count === 0) {
-    stopProcessing();
+    const activeRes = await db.query(`SELECT COUNT(*) as count FROM campaigns WHERE status = 'active'`);
+    if (parseInt(activeRes.rows[0].count) === 0) {
+      stopProcessing();
+    }
+  } catch (e) {
+    console.error('Pause campaign error:', e.message);
   }
 }
 
 /**
  * Resume a paused campaign
  */
-function resumeCampaign(campaignId) {
-  const db = getDb();
-  db.prepare(`UPDATE campaigns SET status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(campaignId);
-  
-  // Also queue any stray pending leads just in case they were left behind by a crash
-  queueCampaign(campaignId);
+async function resumeCampaign(campaignId) {
+  try {
+    const db = await getDb();
+    await db.query(`UPDATE campaigns SET status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [campaignId]);
+    await queueCampaign(campaignId);
+  } catch (e) {
+    console.error('Resume campaign error:', e.message);
+  }
 }
 
 /**
  * Get queue status
  */
-function getQueueStatus() {
-  const db = getDb();
-  const stats = db.prepare(`
-    SELECT
-      SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
-      SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END) as queued,
-      SUM(CASE WHEN status = 'sending' THEN 1 ELSE 0 END) as sending,
-      SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) as sent,
-      SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
-      COUNT(*) as total
-    FROM leads
-  `).get();
+async function getQueueStatus() {
+  try {
+    const db = await getDb();
+    const statsRes = await db.query(`
+      SELECT
+        SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
+        SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END) as queued,
+        SUM(CASE WHEN status = 'sending' THEN 1 ELSE 0 END) as sending,
+        SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) as sent,
+        SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
+        COUNT(*) as total
+      FROM leads
+    `);
+    const stats = statsRes.rows[0];
 
-  return {
-    ...stats,
-    isProcessing: !!queueInterval,
-    sendInterval: currentSendInterval,
-  };
+    return {
+      ...stats,
+      isProcessing: !!queueInterval,
+      sendInterval: currentSendInterval,
+    };
+  } catch (e) {
+    return { isProcessing: !!queueInterval, sendInterval: currentSendInterval };
+  }
 }
 
 /**
  * Load settings from database
  */
-function loadSettings() {
+async function loadSettings() {
   try {
-    const db = getDb();
-    const setting = db.prepare("SELECT value FROM settings WHERE key = 'send_interval'").get();
-    if (setting) {
-      currentSendInterval = parseInt(setting.value);
+    const db = await getDb();
+    const res = await db.query("SELECT value FROM settings WHERE key = 'send_interval'");
+    if (res.rows[0]) {
+      currentSendInterval = parseInt(res.rows[0].value);
       console.log(`⚙️ Loaded Send Interval: ${currentSendInterval}ms`);
     }
   } catch (err) {
@@ -266,33 +289,42 @@ function loadSettings() {
 }
 
 /**
- * Update the send interval and restart the queue if necessary
+ * Update the send interval
  */
-function updateSendInterval(ms) {
-  const db = getDb();
-  currentSendInterval = parseInt(ms);
-  
-  // Persist to DB
-  db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('send_interval', ?)").run(ms.toString());
-  
-  console.log(`⚙️ Send interval updated to: ${ms}ms`);
+async function updateSendInterval(ms) {
+  try {
+    const db = await getDb();
+    currentSendInterval = parseInt(ms);
+    
+    await db.query(`
+      INSERT INTO settings (key, value) VALUES ('send_interval', $1)
+      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+    `, [ms.toString()]);
+    
+    console.log(`⚙️ Send interval updated to: ${ms}ms`);
 
-  // If the queue is running, we need to restart it to pick up the new interval
-  if (queueInterval) {
-    stopProcessing();
-    startProcessing();
+    if (queueInterval) {
+      stopProcessing();
+      startProcessing();
+    }
+  } catch (err) {
+    console.error('Update interval error:', err.message);
   }
 }
 
 /**
  * On server start, resume any active campaigns
  */
-function resumeOnStartup() {
-  const db = getDb();
-  const active = db.prepare(`SELECT COUNT(*) as count FROM campaigns WHERE status = 'active'`).get();
-  if (active.count > 0) {
-    console.log(`📫 Resuming ${active.count} active campaign(s) from previous session`);
-    startProcessing();
+async function resumeOnStartup() {
+  try {
+    const db = await getDb();
+    const res = await db.query(`SELECT COUNT(*) as count FROM campaigns WHERE status = 'active'`);
+    if (parseInt(res.rows[0].count) > 0) {
+      console.log(`📫 Resuming ${res.rows[0].count} active campaign(s) from previous session`);
+      startProcessing();
+    }
+  } catch (e) {
+    console.error('Resume on startup error:', e.message);
   }
 }
 

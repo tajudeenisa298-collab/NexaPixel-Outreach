@@ -2,94 +2,103 @@ const { getDb } = require('../db/database');
 const { sendViaGmail } = require('./gmailSender');
 const { sendViaBrevo } = require('./brevoSender');
 
-
-
-let currentIndex = 0;
-
 /**
- * Reset daily/hourly counters if needed
+ * Reset daily/hourly counters if needed using Postgres timestamp logic
  */
-function resetCountersIfNeeded() {
-  const db = getDb();
-  const now = new Date();
+async function resetCountersIfNeeded() {
+  try {
+    const db = await getDb();
+    
+    // Reset daily counts (24 hours)
+    await db.query(`
+      UPDATE sender_accounts
+      SET daily_sent = 0, last_daily_reset = CURRENT_TIMESTAMP
+      WHERE last_daily_reset < NOW() - INTERVAL '24 hours'
+    `);
 
-  // Reset daily counts (24 hours)
-  db.prepare(`
-    UPDATE sender_accounts
-    SET daily_sent = 0, last_daily_reset = ?
-    WHERE datetime(last_daily_reset, '+24 hours') < datetime(?)
-  `).run(now.toISOString(), now.toISOString());
-
-  // Reset hourly counts (1 hour)
-  db.prepare(`
-    UPDATE sender_accounts
-    SET hourly_sent = 0, last_hourly_reset = ?
-    WHERE datetime(last_hourly_reset, '+1 hour') < datetime(?)
-  `).run(now.toISOString(), now.toISOString());
+    // Reset hourly counts (1 hour)
+    await db.query(`
+      UPDATE sender_accounts
+      SET hourly_sent = 0, last_hourly_reset = CURRENT_TIMESTAMP
+      WHERE last_hourly_reset < NOW() - INTERVAL '1 hour'
+    `);
+  } catch (e) {
+    console.error('Reset counters error:', e.message);
+  }
 }
 
 /**
  * Get the next available sender account (round-robin with limits)
- * @returns {Object|null} - sender account or null if all exhausted
+ * @returns {Promise<Object|null>} - sender account or null if all exhausted
  */
-function getNextSender() {
-  const db = getDb();
-  resetCountersIfNeeded();
+async function getNextSender() {
+  try {
+    const db = await getDb();
+    await resetCountersIfNeeded();
 
-  const accounts = db.prepare(`
-    SELECT * FROM sender_accounts
-    WHERE is_active = 1
-      AND is_paused = 0
-      AND daily_sent < daily_limit
-      AND hourly_sent < hourly_limit
-    ORDER BY daily_sent ASC, last_used_at ASC NULLS FIRST
-  `).all();
+    const res = await db.query(`
+      SELECT * FROM sender_accounts
+      WHERE is_active = 1
+        AND is_paused = 0
+        AND daily_sent < daily_limit
+        AND hourly_sent < hourly_limit
+      ORDER BY daily_sent ASC, last_used_at ASC NULLS FIRST
+      LIMIT 1
+    `);
 
-  if (accounts.length === 0) return null;
-
-  // Round-robin: pick the account with the least sends
-  const account = accounts[0];
-  return account;
+    return res.rows[0] || null;
+  } catch (e) {
+    console.error('Get next sender error:', e.message);
+    return null;
+  }
 }
 
 /**
  * Record that a send was made from a specific account
  */
-function recordSend(accountId) {
-  const db = getDb();
-  db.prepare(`
-    UPDATE sender_accounts
-    SET daily_sent = daily_sent + 1,
-        hourly_sent = hourly_sent + 1,
-        last_used_at = CURRENT_TIMESTAMP
-    WHERE id = ?
-  `).run(accountId);
+async function recordSend(accountId) {
+  try {
+    const db = await getDb();
+    await db.query(`
+      UPDATE sender_accounts
+      SET daily_sent = daily_sent + 1,
+          hourly_sent = hourly_sent + 1,
+          last_used_at = CURRENT_TIMESTAMP
+      WHERE id = $1
+    `, [accountId]);
+  } catch (e) {
+    console.error('Record send error:', e.message);
+  }
 }
 
 /**
  * Record an error for a specific account
  */
-function recordError(accountId, errorMessage) {
-  const db = getDb();
-  
-  const isCritical = errorMessage && (
-    errorMessage.includes('534') || 
-    errorMessage.includes('Invalid login') || 
-    errorMessage.includes('blocked') ||
-    errorMessage.includes('Rate limit') ||
-    errorMessage.includes('Credentials not found')
-  );
+async function recordError(accountId, errorMessage) {
+  try {
+    const db = await getDb();
+    
+    const isCritical = errorMessage && (
+      errorMessage.includes('534') || 
+      errorMessage.includes('Invalid login') || 
+      errorMessage.includes('blocked') ||
+      errorMessage.includes('Rate limit') ||
+      errorMessage.includes('Credentials not found')
+    );
 
-  db.prepare(`
-    UPDATE sender_accounts
-    SET last_error = ?, 
-        is_active = CASE 
-          WHEN ? THEN 0 
-          WHEN daily_sent > daily_limit THEN 0 
-          ELSE is_active 
-        END
-    WHERE id = ?
-  `).run(errorMessage, isCritical ? 1 : 0, accountId);
+    await db.query(`
+      UPDATE sender_accounts
+      SET last_error = $1, 
+          is_active = CASE 
+            WHEN $2 = true THEN 0 
+            WHEN daily_sent >= daily_limit THEN 0 
+            ELSE is_active 
+          END
+      WHERE id = $3
+    `, [errorMessage, isCritical, accountId]);
+  } catch (e) {
+    console.error('Record error error:', e.message);
+  }
 }
 
 /**
@@ -98,8 +107,7 @@ function recordError(accountId, errorMessage) {
  * @returns {Promise<Object>} - { success, senderEmail, messageId, error }
  */
 async function sendWithRotation(emailData) {
-  let sender = getNextSender();
-  
+  let sender = await getNextSender();
   let attempts = 0;
   
   while (sender && attempts < 3) {
@@ -108,8 +116,8 @@ async function sendWithRotation(emailData) {
 
     if (sender.type === 'gmail' || sender.type === 'outlook' || sender.type === 'zoho' || sender.type === 'smtp') {
       if (!sender.password) {
-        recordError(sender.id, 'Credentials not found in database');
-        sender = getNextSender();
+        await recordError(sender.id, 'Credentials not found in database');
+        sender = await getNextSender();
         continue;
       }
 
@@ -119,8 +127,8 @@ async function sendWithRotation(emailData) {
       );
     } else if (sender.type === 'brevo') {
       if (!sender.password) {
-        recordError(sender.id, 'Brevo API key not found in database');
-        sender = getNextSender();
+        await recordError(sender.id, 'Brevo API key not found in database');
+        sender = await getNextSender();
         continue;
       }
 
@@ -131,7 +139,7 @@ async function sendWithRotation(emailData) {
     }
 
     if (result.success) {
-      recordSend(sender.id);
+      await recordSend(sender.id);
       return {
         success: true,
         senderEmail: sender.email,
@@ -139,7 +147,7 @@ async function sendWithRotation(emailData) {
         messageId: result.messageId,
       };
     } else {
-      recordError(sender.id, result.error);
+      await recordError(sender.id, result.error);
       
       const isCritical = result.error && (
         result.error.includes('534') || 
@@ -151,7 +159,7 @@ async function sendWithRotation(emailData) {
 
       if (isCritical) {
         console.log(`⚠️ Sender ${sender.email} failed with critical error. Trying another sender...`);
-        sender = getNextSender();
+        sender = await getNextSender();
       } else {
         return {
           success: false,
@@ -179,33 +187,44 @@ async function sendWithRotation(emailData) {
 /**
  * Get status of all sender accounts
  */
-function getAccountsStatus() {
-  const db = getDb();
-  resetCountersIfNeeded();
-  return db.prepare(`
-    SELECT id, email, type, display_name, daily_sent, daily_limit, hourly_sent, hourly_limit,
-           is_active, is_paused, last_error, last_used_at, created_at
-    FROM sender_accounts
-    ORDER BY type, email
-  `).all();
+async function getAccountsStatus() {
+  try {
+    const db = await getDb();
+    await resetCountersIfNeeded();
+    const res = await db.query(`
+      SELECT id, email, type, display_name, daily_sent, daily_limit, hourly_sent, hourly_limit,
+             is_active, is_paused, last_error, last_used_at, created_at
+      FROM sender_accounts
+      ORDER BY type, email
+    `);
+    return res.rows;
+  } catch (e) {
+    console.error('Get accounts status error:', e.message);
+    return [];
+  }
 }
 
 /**
  * Get total remaining capacity across all accounts
  */
-function getRemainingCapacity() {
-  const db = getDb();
-  resetCountersIfNeeded();
-  const result = db.prepare(`
-    SELECT
-      SUM(daily_limit - daily_sent) as remaining_daily,
-      SUM(hourly_limit - hourly_sent) as remaining_hourly,
-      COUNT(*) as total_accounts,
-      SUM(CASE WHEN is_active = 1 AND is_paused = 0 AND daily_sent < daily_limit THEN 1 ELSE 0 END) as active_accounts
-    FROM sender_accounts
-    WHERE is_active = 1 AND is_paused = 0
-  `).get();
-  return result;
+async function getRemainingCapacity() {
+  try {
+    const db = await getDb();
+    await resetCountersIfNeeded();
+    const res = await db.query(`
+      SELECT
+        SUM(daily_limit - daily_sent) as remaining_daily,
+        SUM(hourly_limit - hourly_sent) as remaining_hourly,
+        COUNT(*) as total_accounts,
+        SUM(CASE WHEN is_active = 1 AND is_paused = 0 AND daily_sent < daily_limit THEN 1 ELSE 0 END) as active_accounts
+      FROM sender_accounts
+      WHERE is_active = 1 AND is_paused = 0
+    `);
+    return res.rows[0];
+  } catch (e) {
+    console.error('Get remaining capacity error:', e.message);
+    return { remaining_daily: 0, remaining_hourly: 0, total_accounts: 0, active_accounts: 0 };
+  }
 }
 
 module.exports = {
