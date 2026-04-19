@@ -17,8 +17,7 @@ app.use(express.urlencoded({ extended: true }));
 // Trust proxy for IP tracking
 app.set('trust proxy', true);
 
-const pool = require('./db/database').pool;
-const { initSchema, seedSenderAccounts } = require('./db/database');
+const { pool } = require('./db/database');
 
 async function startApp() {
   try {
