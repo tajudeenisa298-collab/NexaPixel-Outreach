@@ -3,6 +3,24 @@ const router = express.Router();
 const { getDb } = require('../db/database');
 const { verifyGmailAccount } = require('../services/gmailSender');
 
+// GET /api/accounts - List all sender accounts
+router.get('/', async (req, res) => {
+  try {
+    const db = await getDb();
+    const result = await db.query(`
+      SELECT id, email, type, display_name, daily_sent, daily_limit, 
+             hourly_sent, hourly_limit, is_active, is_paused, 
+             last_error, last_used_at 
+      FROM sender_accounts 
+      ORDER BY created_at DESC
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('List accounts error:', err);
+    res.status(500).json({ error: 'Failed to fetch accounts' });
+  }
+});
+
 // POST /api/accounts - Add a new sender account
 router.post('/', async (req, res) => {
   const { email, password, type, display_name } = req.body;
