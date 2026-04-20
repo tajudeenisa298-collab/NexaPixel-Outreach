@@ -3,7 +3,7 @@ const router = express.Router();
 const { getDb } = require('../db/database');
 const { verifyGmailAccount } = require('../services/gmailSender');
 
-// GET /api/accounts - List all sender accounts
+// GET /api/accounts - List all sender accounts + capacity stats
 router.get('/', async (req, res) => {
   try {
     const db = await getDb();
@@ -14,7 +14,26 @@ router.get('/', async (req, res) => {
       FROM sender_accounts 
       ORDER BY created_at DESC
     `);
-    res.json(result.rows);
+    
+    const accounts = result.rows;
+    
+    // Calculate capacity metrics for the dashboard
+    const activeAccounts = accounts.filter(a => 
+      a.is_active === 1 && 
+      a.is_paused === 0 && 
+      a.daily_sent < a.daily_limit
+    );
+
+    const capacity = {
+      active_accounts: activeAccounts.length,
+      remaining_daily: activeAccounts.reduce((sum, a) => 
+        sum + Math.max(0, a.daily_limit - a.daily_sent), 0
+      ),
+      total_daily_limit: accounts.reduce((sum, a) => sum + a.daily_limit, 0)
+    };
+
+    // Return the wrapped object expected by src/pages/Accounts.jsx
+    res.json({ accounts, capacity });
   } catch (err) {
     console.error('List accounts error:', err);
     res.status(500).json({ error: 'Failed to fetch accounts' });
