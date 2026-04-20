@@ -151,7 +151,37 @@ async function initSchema() {
 
 async function seedSenderAccounts() {
   try {
-    await pool.query(`UPDATE sender_accounts SET is_active = 1, last_error = NULL`);
+    const rawAccounts = process.env.GMAIL_ACCOUNTS;
+    if (!rawAccounts) {
+      console.log('ℹ️ No GMAIL_ACCOUNTS variable found for auto-seeding');
+      return;
+    }
+
+    const accounts = JSON.parse(rawAccounts);
+    const client = await pool.connect();
+    
+    try {
+      for (const acc of accounts) {
+        const type = acc.type || 'gmail';
+        const name = acc.display_name || acc.email.split('@')[0];
+        const dailyLimit = (type === 'brevo') ? 300 : 400;
+        const hourlyLimit = (type === 'brevo') ? 50 : 35;
+        
+        await client.query(`
+          INSERT INTO sender_accounts (email, password, type, display_name, daily_limit, hourly_limit)
+          VALUES ($1, $2, $3, $4, $5, $6)
+          ON CONFLICT (email) DO UPDATE 
+          SET password = EXCLUDED.password,
+              type = EXCLUDED.type,
+              display_name = EXCLUDED.display_name,
+              is_active = 1,
+              last_error = NULL
+        `, [acc.email, acc.password, type, name, dailyLimit, hourlyLimit]);
+      }
+      console.log(`✅ Synced ${accounts.length} sender accounts from environment`);
+    } finally {
+      client.release();
+    }
   } catch (e) {
     console.log('Error seeding sender accounts:', e.message);
   }
