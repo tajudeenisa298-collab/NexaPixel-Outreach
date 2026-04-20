@@ -60,6 +60,14 @@ async function processNextEmail() {
   isProcessing = true;
 
   try {
+    // Safety watchdog: prevent infinite lock
+    const lockTimeout = setTimeout(() => {
+      if (isProcessing) {
+        console.warn('⚠️ Queue lock timeout reached. Releasing lock.');
+        isProcessing = false;
+      }
+    }, 120000); // 2 minute emergency release
+
     const db = await getDb();
 
     // Get the next queued lead
@@ -159,6 +167,7 @@ async function processNextEmail() {
   } catch (error) {
     console.error('Queue processing error:', error);
   } finally {
+    if (typeof lockTimeout !== 'undefined') clearTimeout(lockTimeout);
     isProcessing = false;
   }
 }
@@ -318,6 +327,13 @@ async function updateSendInterval(ms) {
 async function resumeOnStartup() {
   try {
     const db = await getDb();
+    
+    // Reset any leads that were stuck in SENDING (server crashed or hung)
+    const resetRes = await db.query("UPDATE leads SET status = 'queued' WHERE status = 'sending'");
+    if (resetRes.rowCount > 0) {
+      console.log(`📡 Reset ${resetRes.rowCount} stuck 'SENDING' leads back to queue`);
+    }
+
     const res = await db.query(`SELECT COUNT(*) as count FROM campaigns WHERE status = 'active'`);
     if (parseInt(res.rows[0].count) > 0) {
       console.log(`📫 Resuming ${res.rows[0].count} active campaign(s) from previous session`);

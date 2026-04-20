@@ -32,6 +32,9 @@ async function sendViaBrevo(account, emailData) {
     payload.htmlContent = emailData.html;
   }
 
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s timeout
+
   try {
     const response = await fetch(BREVO_API_URL, {
       method: 'POST',
@@ -41,7 +44,10 @@ async function sendViaBrevo(account, emailData) {
         'content-type': 'application/json',
       },
       body: JSON.stringify(payload),
+      signal: controller.signal
     });
+    
+    clearTimeout(timeoutId);
 
     const data = await response.json();
 
