@@ -1,4 +1,4 @@
-const API_BASE = 'http://localhost:3001/api';
+const API_BASE = '/api';
 
 export async function fetchApi(endpoint, options = {}) {
   const url = `${API_BASE}${endpoint}`;
@@ -27,7 +27,7 @@ export const api = {
   getOverview: () => fetchApi('/analytics/overview'),
   getDailyStats: (days = 30) => fetchApi(`/analytics/daily?days=${days}`),
   // Accounts
-  getAccounts: () => fetchApi('/analytics/accounts'),
+  getAccounts: () => fetchApi('/accounts'),
   addAccount: (data) => fetchApi('/accounts', { method: 'POST', body: JSON.stringify(data) }),
   deleteAccount: (id) => fetchApi(`/accounts/${id}`, { method: 'DELETE' }),
   toggleAccountPause: (id, isPaused) => fetchApi(`/accounts/${id}/pause`, { method: 'PUT', body: JSON.stringify({ is_paused: isPaused }) }),
