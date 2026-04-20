@@ -25,19 +25,20 @@ async function startApp() {
     
     await loadSettings();
     await seedSenderAccounts();
+
+    // Start server ONLY after DB is ready
+    app.listen(PORT, () => {
+      console.log(`🚀 Server running on port ${PORT}`);
+
+      // Background services
+      resumeOnStartup();
+      startSequenceEngine();
+    });
   } catch (error) {
     console.error('❌ Failed to initialize app state:', error);
+    process.exit(1);
   }
 }
-
-// Global error handler for async routes in Express 5
-app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
-  res.status(500).json({ error: 'Internal Server Error' });
-});
-
-// Start initialization
-startApp();
 
 // API Routes
 app.use('/api/campaigns', require('./routes/campaigns'));
@@ -72,11 +73,11 @@ if (process.env.NODE_ENV === 'production') {
   });
 }
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+// Start initialization
+startApp();
 
-  // Background services
-  resumeOnStartup();
-  startSequenceEngine();
+// Global error handler
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({ error: 'Internal Server Error' });
 });
