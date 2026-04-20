@@ -58,10 +58,11 @@ if (process.env.NODE_ENV === 'production') {
   const distPath = path.join(__dirname, '..', 'dist');
   app.use(express.static(distPath));
   
-  // Use a more robust catch-all for SPAs
-  app.get('/:path*', (req, res) => {
-    // Only handle non-API routes
+  // Use a middleware instead of a path string to avoid Express 5 wildcard issues
+  app.use((req, res) => {
+    // Only handle non-API/non-tracking routes
     if (!req.path.startsWith('/api/') && !req.path.startsWith('/t/')) {
+       const distPath = path.join(__dirname, '..', 'dist');
        res.sendFile(path.join(distPath, 'index.html'), (err) => {
          if (err) {
            res.status(404).send('Frontend not built yet. Run build first.');
