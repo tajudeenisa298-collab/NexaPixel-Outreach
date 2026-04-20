@@ -59,7 +59,7 @@ if (process.env.NODE_ENV === 'production') {
   app.use(express.static(distPath));
   
   // Use a more robust catch-all for SPAs
-  app.get('(.*)', (req, res) => {
+  app.get('/:path*', (req, res) => {
     // Only handle non-API routes
     if (!req.path.startsWith('/api/') && !req.path.startsWith('/t/')) {
        res.sendFile(path.join(distPath, 'index.html'), (err) => {
