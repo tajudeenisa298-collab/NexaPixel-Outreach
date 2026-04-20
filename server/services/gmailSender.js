@@ -25,7 +25,11 @@ function getTransporter(email, password, type = 'gmail') {
   };
 
   if (type === 'gmail') {
-    transportConfig.service = 'gmail';
+    transportConfig.host = 'smtp.gmail.com';
+    transportConfig.port = 587;
+    transportConfig.secure = false; // Use STARTTLS
+    transportConfig.debug = true;   // See connection details in logs
+    transportConfig.logger = true;  // Log to console
   } else if (type === 'outlook') {
     transportConfig.service = 'hotmail'; // nodemailer maps hotmail to Outlook/Hotmail servers
   } else if (type === 'zoho') {
