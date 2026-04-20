@@ -37,8 +37,8 @@ router.get('/overview', async (req, res) => {
       ? ((totalClickCount / totalSentCount) * 100).toFixed(1)
       : 0;
 
-    const capacity = getRemainingCapacity();
-    const queueStatus = getQueueStatus();
+    const capacity = await getRemainingCapacity();
+    const queueStatus = await getQueueStatus();
 
     res.json({
       ...totals,
